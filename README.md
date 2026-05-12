@@ -34,7 +34,7 @@ python -m robocasa.scripts.download_kitchen_assets   # Caution: Assets to be dow
 Step2: Install GR00T-N1.5 
 ```bash
 cd ~/workbench/AI_617
-git clone https://github.com/kaixin-VTRB/GR00T-robocasa.git
+git clone git@github.com:cckaixin/GR00T-robocasa.git
 cd GR00T-robocasa
 
 pip uninstall torch torchvision torchaudio -y   # if installed other version. uninstall first.
