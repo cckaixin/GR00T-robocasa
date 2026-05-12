@@ -1,0 +1,10 @@
+{
+  "skills": [
+    "move_forward",
+    "move_backward",
+    "turn_left",
+    "turn_right",
+    "policy_step",
+    "demo_external_skill_name_only"
+  ]
+}

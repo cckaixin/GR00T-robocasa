@@ -53,6 +53,7 @@ pip install --no-build-isolation flash-attn==2.7.1.post4  # This will take 30-60
 pip uninstall tensorflow -y
 pip install --force-reinstall opencv-python-headless opencv-python
 pip install numpy==2.2.5
+pip install streamlit
 ```
 
 ## Download Policy CKPT
@@ -67,13 +68,75 @@ hf download robocasa/robocasa365_checkpoints \
 
 ## Run single env with mujogo UI
 ```bash
-cd ~/workbench/AI_617/R00T-robocasa
+cd ~/workbench/AI_617/GR00T-robocasa
 
 python scripts/run_single_env.py \
     --model_path ../checkpoint-60000/gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000 \
     --env_name RinseSinkBasin \
     --split target
 ```
+
+## Agentic bridge API (ZeroMQ)
+Start a simulator bridge server so another repo/process can connect and control RoboCasa:
+```bash
+cd ~/workbench/AI_617/GR00T-robocasa
+conda activate robocasa
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"   # recommended for flash-attn runtime
+
+python scripts/run_agentic_bridge.py \
+    --model_path ../checkpoint-60000/gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000 \
+    --env_name RinseSinkBasin \
+    --split target \
+    --port 8010
+```
+
+Available endpoints:
+- `status`, `reset`, `get_observation`
+- `step_policy`, `step_action`
+- `move` (`forward` / `backward` / `turn_left` / `turn_right`)
+- `configure_environment` (`split`, optional `env_name`, `max_steps`, `layout_id`, `style_id`)
+- `get_snapshot` (status + observation + skills in one request)
+- `list_atomic_tasks`, `list_composite_tasks`
+- `list_skills`, `register_skills`, `call_skill`
+
+Minimal client usage:
+```python
+from gr00t.eval.service import BaseInferenceClient
+
+client = BaseInferenceClient(host="localhost", port=8010)
+print(client.call_endpoint("status", requires_input=False))
+obs = client.call_endpoint("get_observation", requires_input=False)
+client.call_endpoint("move", {"command": "forward", "magnitude": 0.5, "repeat": 1})
+```
+
+## Demo bridge client
+`scripts/demo_agentic_bridge.py` is a reference client for building agentic workflow. It:
+- connects to `run_agentic_bridge.py`
+- fetches status + observation (polling interval configurable)
+- sends commands (`move`, `step_policy`, `call_skill`)
+- treats atomic task names as skill calls (calling one switches current task)
+- configures scene (`split`, `layout_id`, `style_id`, optional `max_steps`) from UI
+- supports UI layout/style controls (camera columns, image width, shown panels)
+- shows latest camera observations and status in Streamlit dashboard
+
+Run it in a second terminal after the bridge server is up:
+```bash
+cd ~/workbench/AI_617/GR00T-robocasa
+conda activate robocasa
+streamlit run scripts/demo_agentic_bridge.py -- --host localhost --port 8010
+```
+
+Recommended Streamlit usage:
+- **Task selection**: use `Skill Call` dropdown; atomic task names are included as skills.
+- **Scene control**: in sidebar `Environment`, choose `split` and optional `layout_id` / `style_id`.
+  - Use `split=custom` when setting explicit `layout_id` / `style_id`.
+- **Refresh rate**: start with `poll interval = 1.0s`, then lower gradually if stable.
+- **Move defaults**: UI move magnitude default is `0.5`.
+- **After bridge code changes**: restart both bridge and Streamlit app.
+
+Note:
+- Do not run `python scripts/demo_agentic_bridge.py ...`
+- Streamlit apps must be started with `streamlit run ...`
 
 ## Troubleshooting
 If you see:

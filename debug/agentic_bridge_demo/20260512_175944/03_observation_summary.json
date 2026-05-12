@@ -1,0 +1,13 @@
+{
+  "keys": [
+    "annotation.human.task_description",
+    "state.base_position",
+    "state.base_rotation",
+    "state.end_effector_position_relative",
+    "state.end_effector_rotation_relative",
+    "state.gripper_qpos",
+    "video.robot0_agentview_left",
+    "video.robot0_agentview_right",
+    "video.robot0_eye_in_hand"
+  ]
+}
