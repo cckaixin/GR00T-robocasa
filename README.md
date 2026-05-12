@@ -2,6 +2,14 @@
 
 This is the NVIDIA Isaac GR00T fork repo for running RoboCasa benchmark experiments. This fork is based on the original [GR00T code](https://github.com/NVIDIA/Isaac-GR00T) from NVIDIA. Our fork supports training for **GR00T N1.5**.
 
+## TODO
+1. Simplify the system's launch and configuration.
+2. Expose APIs to make it accessible to OpenCLAW.
+   - Task Specification
+   - Camera Observation Retrieval
+   - Skill Stack List
+   - etc.
+
 ## Recommended system specs
 
 For inference we recommend a GPU with at least 8 Gb of memory. (5090 Recommended)
@@ -39,7 +47,7 @@ cd GR00T-robocasa
 
 pip uninstall torch torchvision torchaudio -y   # if installed other version. uninstall first.
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128   # This is for my 5050 pick one suits your GPU 
-pip install -e .[base]
+pip install -e .
 pip install --no-build-isolation flash-attn==2.7.1.post4  # This will take 30-60mins
 
 pip uninstall tensorflow -y
@@ -57,7 +65,6 @@ hf download robocasa/robocasa365_checkpoints \
   --repo-type model
 ```
 
-
 ## Run single env with mujogo UI
 ```bash
 cd ~/workbench/AI_617/R00T-robocasa
@@ -68,13 +75,16 @@ python scripts/run_single_env.py \
     --split target
 ```
 
-## TODO
-1. Simplify the system's launch and configuration.
-2. Expose APIs to make it accessible to OpenCLAW.
-   - Task Specification
-   - Camera Observation Retrieval
-   - Skill Stack List
-   - etc.
+## Troubleshooting
+If you see:
+- `ImportError: ... libstdc++.so.6: version 'CXXABI_1.3.15' not found`
+- or failure importing `flash_attn_2_cuda`
+
+Install conda C++ runtime in your env:
+```bash
+conda activate robocasa
+conda install -y -c conda-forge libstdcxx-ng libgcc-ng
+```
 
 ## Relevant Document
 1. Robocasa: https://robocasa.ai/docs/build/html/introduction/overview.html
