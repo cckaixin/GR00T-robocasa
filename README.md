@@ -2,14 +2,6 @@
 
 This is the NVIDIA Isaac GR00T fork repo for running RoboCasa benchmark experiments. This fork is based on the original [GR00T code](https://github.com/NVIDIA/Isaac-GR00T) from NVIDIA. Our fork supports training for **GR00T N1.5**.
 
-## TODO
-1. Simplify the system's launch and configuration.
-2. Expose APIs to make it accessible to OpenCLAW.
-   - Task Specification
-   - Camera Observation Retrieval
-   - Skill Stack List
-   - etc.
-
 ## Recommended system specs
 
 For inference we recommend a GPU with at least 8 Gb of memory. (5090 Recommended)
@@ -85,10 +77,10 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"   # recommended fo
 
 python scripts/run_agentic_bridge.py \
     --model_path ../checkpoint-60000/gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000 \
-    --env_name RinseSinkBasin \
-    --split target \
     --port 8010
 ```
+By default, bridge now starts **without launching simulator**.  
+You launch/configure env from Streamlit UI (or via `configure_environment` endpoint).
 
 Available endpoints:
 - `status`, `reset`, `get_observation`
@@ -96,6 +88,7 @@ Available endpoints:
 - `move` (`forward` / `backward` / `turn_left` / `turn_right`)
 - `configure_environment` (`split`, optional `env_name`, `max_steps`, `layout_id`, `style_id`)
 - `get_snapshot` (status + observation + skills in one request)
+- `list_available_envs`, `list_scene_config`
 - `list_atomic_tasks`, `list_composite_tasks`
 - `list_skills`, `register_skills`, `call_skill`
 
@@ -112,11 +105,15 @@ client.call_endpoint("move", {"command": "forward", "magnitude": 0.5, "repeat": 
 ## Demo bridge client
 `scripts/demo_agentic_bridge.py` is a reference client for building agentic workflow. It:
 - connects to `run_agentic_bridge.py`
-- fetches status + observation (polling interval configurable)
+- launches simulator from UI after choosing env + scene config
+- fetches status + observation
 - sends commands (`move`, `step_policy`, `call_skill`)
 - treats atomic task names as skill calls (calling one switches current task)
-- configures scene (`split`, `layout_id`, `style_id`, optional `max_steps`) from UI
-- supports UI layout/style controls (camera columns, image width, shown panels)
+- configures scene (`split`, optional `layout_id`, optional `style_id`, optional `max_steps`) from UI
+- supports two observation modes:
+  - `Get obs once action end`
+  - `Interval by env steps` (`0` = every step, `1` = every 2 steps)
+- supports UI display controls (image width)
 - shows latest camera observations and status in Streamlit dashboard
 
 Run it in a second terminal after the bridge server is up:
@@ -127,10 +124,13 @@ streamlit run scripts/demo_agentic_bridge.py -- --host localhost --port 8010
 ```
 
 Recommended Streamlit usage:
-- **Task selection**: use `Skill Call` dropdown; atomic task names are included as skills.
-- **Scene control**: in sidebar `Environment`, choose `split` and optional `layout_id` / `style_id`.
-  - Use `split=custom` when setting explicit `layout_id` / `style_id`.
-- **Refresh rate**: start with `poll interval = 1.0s`, then lower gradually if stable.
+- **Launch first from UI**: choose `Task / Env Name`, `split`, optional `layout_id` / `style_id`, then click `Launch / Apply Environment`.
+- **Task switch later**: use `Skill Call` dropdown; atomic task names are included as skills.
+- **Scene control rule**: explicit `layout_id` / `style_id` requires `split=custom`.
+- **Observation mode**:
+  - `Get obs once action end` for deterministic step-by-step interaction
+  - `Interval by env steps` for periodic updates
+- **Refresh rate**: for interval mode, start with `UI poll interval = 1.0s`, then lower if stable.
 - **Move defaults**: UI move magnitude default is `0.5`.
 - **After bridge code changes**: restart both bridge and Streamlit app.
 

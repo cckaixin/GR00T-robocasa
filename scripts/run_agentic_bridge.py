@@ -42,6 +42,10 @@ from gr00t.eval.service import BaseInferenceServer
 from gr00t.eval.wrappers.multistep_wrapper import MultiStepWrapper
 from gr00t.experiment.data_config import DATA_CONFIG_MAP
 from gr00t.model.policy import Gr00tPolicy
+from robocasa.models.scenes.scene_registry import (
+    LAYOUT_GROUPS_TO_IDS,
+    STYLE_GROUPS_TO_IDS,
+)
 from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
 from robocasa.utils.dataset_registry_utils import get_task_horizon
 
@@ -75,11 +79,11 @@ def _get_robosuite_env(vec_env):
 class AgenticBridgeCore:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.env_name = args.env_name
+        self.env_name: Optional[str] = args.env_name
         self.split = args.split
         self.layout_id: Optional[int] = None
         self.style_id: Optional[int] = None
-        self.max_steps = args.max_steps or get_task_horizon(self.env_name)
+        self.max_steps = args.max_steps
         self.step_count = 0
         self.done = False
         self.success = False
@@ -99,7 +103,6 @@ class AgenticBridgeCore:
 
         self.vec_env = None
         self.rs_env = None
-        self._rebuild_env(self.env_name, self.split, self.max_steps)
 
         # Teammates can register additional names, but built-ins are executable now.
         self.skills: Dict[str, Dict[str, Any]] = {
@@ -110,7 +113,11 @@ class AgenticBridgeCore:
             "policy_step": {"type": "builtin"},
         }
 
-        self.reset()
+        # Optional startup env can be provided, but default behavior is lazy launch.
+        if self.env_name:
+            init_max_steps = self.max_steps or get_task_horizon(self.env_name)
+            self._rebuild_env(self.env_name, self.split, init_max_steps)
+            self.reset()
 
     def close(self):
         if self.vec_env is not None:
@@ -127,6 +134,8 @@ class AgenticBridgeCore:
         layout_id: Optional[int] = None,
         style_id: Optional[int] = None,
     ):
+        if not env_name:
+            raise ValueError("env_name is required to launch simulator")
         if self.vec_env is not None:
             try:
                 self.vec_env.close()
@@ -138,7 +147,7 @@ class AgenticBridgeCore:
             raise ValueError("layout/style overrides require split='custom'")
         self.env_name = env_name
         self.split = split
-        self.max_steps = max_steps
+        self.max_steps = int(max_steps)
         self.layout_id = layout_id
         self.style_id = style_id
         env_fn = _make_single_env(self.env_name, self.split, self.args.n_action_steps, self.max_steps)
@@ -167,7 +176,13 @@ class AgenticBridgeCore:
                 base_env = self.vec_env.envs[0]
         self.rs_env = _get_robosuite_env(self.vec_env)
 
+    def _ensure_env_ready(self):
+        if self.vec_env is None or self.rs_env is None:
+            raise RuntimeError("Simulator is not launched. Call configure_environment first.")
+
     def _render_update(self):
+        if self.rs_env is None:
+            return
         if self.rs_env is not None and hasattr(self.rs_env, "viewer") and self.rs_env.viewer is not None:
             self.rs_env.viewer.update()
 
@@ -221,6 +236,7 @@ class AgenticBridgeCore:
         out = {
             "env_name": self.env_name,
             "split": self.split,
+            "env_ready": self.vec_env is not None,
             "step_count": self.step_count,
             "max_steps": self.max_steps,
             "n_action_steps": self.args.n_action_steps,
@@ -239,6 +255,7 @@ class AgenticBridgeCore:
         return out
 
     def reset(self) -> Dict[str, Any]:
+        self._ensure_env_ready()
         self.step_count = 0
         self.done = False
         self.success = False
@@ -260,6 +277,8 @@ class AgenticBridgeCore:
         style_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         new_env_name = env_name or self.env_name
+        if not new_env_name:
+            raise ValueError("env_name must be specified at least once before launch")
         new_split = split or self.split
         if new_split not in ("pretrain", "target", "custom"):
             raise ValueError("split must be pretrain, target, or custom")
@@ -273,19 +292,60 @@ class AgenticBridgeCore:
     def list_composite_tasks(self) -> Dict[str, Any]:
         return {"composite_tasks": list(TASK_SET_REGISTRY.get("all_composite_tasks", []))}
 
+    def list_available_envs(self) -> Dict[str, Any]:
+        return {
+            "all_tasks": list(TASK_SET_REGISTRY.get("all_tasks", [])),
+            "atomic_tasks": list(TASK_SET_REGISTRY.get("all_atomic_tasks", [])),
+            "composite_tasks": list(TASK_SET_REGISTRY.get("all_composite_tasks", [])),
+        }
+
+    def list_scene_config(self) -> Dict[str, Any]:
+        return {
+            "layout_id_range": [1, 60],
+            "style_id_range": [1, 60],
+            "layout_groups": LAYOUT_GROUPS_TO_IDS,
+            "style_groups": STYLE_GROUPS_TO_IDS,
+            "split_options": ["pretrain", "target", "custom"],
+            # Derived from robocasa scene registry groups:
+            # test=-1 -> 1..10, train=-2 -> 11..60, all=-3 -> 1..60
+            "split_layout_style_ranges": {
+                "target": [1, 10],
+                "pretrain": [11, 60],
+                "custom": [1, 60],
+            },
+        }
+
+    def list_policy_descriptions(self) -> Dict[str, Any]:
+        candidates = []
+        task_instruction = self.status().get("task_instruction")
+        if task_instruction is not None:
+            if isinstance(task_instruction, (tuple, list)) and len(task_instruction) > 0:
+                candidates.append(str(task_instruction[0]))
+            else:
+                candidates.append(str(task_instruction))
+        if self.env_name:
+            candidates.append(str(self.env_name))
+        deduped = list(dict.fromkeys([c for c in candidates if c]))
+        return {"policy_descriptions": deduped}
+
     def snapshot(self) -> Dict[str, Any]:
+        observation = None
+        if self.vec_env is not None and self.last_obs is not None:
+            observation = self.get_observation()
         return {
             "status": self.status(),
-            "observation": self.get_observation(),
+            "observation": observation,
             "skills": {"skills": list(self.skills.keys()) + list(TASK_SET_REGISTRY.get("all_atomic_tasks", []))},
         }
 
     def get_observation(self) -> Dict[str, Any]:
+        self._ensure_env_ready()
         if self.last_obs is None:
             raise RuntimeError("No observation available. Call reset first.")
         return self.last_obs
 
     def step_action(self, action: Dict[str, Any], repeat: int = 1) -> Dict[str, Any]:
+        self._ensure_env_ready()
         if self.done:
             return self.status()
         action_dict = self._coerce_action(action)
@@ -298,7 +358,8 @@ class AgenticBridgeCore:
             self._render_update()
         return self.status()
 
-    def step_policy(self, repeat: int = 1) -> Dict[str, Any]:
+    def step_policy(self, repeat: int = 1, description: Optional[str] = None) -> Dict[str, Any]:
+        self._ensure_env_ready()
         if self.last_obs is None:
             raise RuntimeError("No observation available. Call reset first.")
         if self.done:
@@ -306,7 +367,11 @@ class AgenticBridgeCore:
         for _ in range(repeat):
             if self.done:
                 break
-            action_dict = self.policy.get_action(self.last_obs)
+            policy_obs = self.last_obs
+            if description is not None and description.strip():
+                policy_obs = dict(self.last_obs)
+                policy_obs["annotation.human.task_description"] = (description.strip(),)
+            action_dict = self.policy.get_action(policy_obs)
             obs, reward, terminated, truncated, info = self.vec_env.step(action_dict)
             self.last_obs = obs
             self._update_flags(reward, terminated, truncated, info)
@@ -343,7 +408,10 @@ class AgenticBridgeCore:
     def call_skill(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = params or {}
         if name == "policy_step":
-            return self.step_policy(repeat=int(params.get("repeat", 1)))
+            return self.step_policy(
+                repeat=int(params.get("repeat", 1)),
+                description=params.get("description"),
+            )
         if name == "move_forward":
             return self.move("forward", float(params.get("magnitude", 0.5)), int(params.get("repeat", 1)))
         if name == "move_backward":
@@ -373,6 +441,9 @@ class AgenticBridgeServer(BaseInferenceServer):
         self.register_endpoint("step_action", self._step_action, requires_input=True)
         self.register_endpoint("move", self._move, requires_input=True)
         self.register_endpoint("list_skills", self._list_skills, requires_input=False)
+        self.register_endpoint("list_available_envs", self._list_available_envs, requires_input=False)
+        self.register_endpoint("list_scene_config", self._list_scene_config, requires_input=False)
+        self.register_endpoint("list_policy_descriptions", self._list_policy_descriptions, requires_input=False)
         self.register_endpoint("list_atomic_tasks", self._list_atomic_tasks, requires_input=False)
         self.register_endpoint("list_composite_tasks", self._list_composite_tasks, requires_input=False)
         self.register_endpoint("configure_environment", self._configure_environment, requires_input=True)
@@ -390,7 +461,8 @@ class AgenticBridgeServer(BaseInferenceServer):
 
     def _step_policy(self, data: Dict[str, Any]):
         repeat = int(data.get("repeat", 1))
-        return self.core.step_policy(repeat=repeat)
+        description = data.get("description")
+        return self.core.step_policy(repeat=repeat, description=description)
 
     def _step_action(self, data: Dict[str, Any]):
         if "action" not in data:
@@ -408,6 +480,15 @@ class AgenticBridgeServer(BaseInferenceServer):
 
     def _list_skills(self):
         return {"skills": list(self.core.skills.keys()) + list(TASK_SET_REGISTRY.get("all_atomic_tasks", []))}
+
+    def _list_available_envs(self):
+        return self.core.list_available_envs()
+
+    def _list_scene_config(self):
+        return self.core.list_scene_config()
+
+    def _list_policy_descriptions(self):
+        return self.core.list_policy_descriptions()
 
     def _list_atomic_tasks(self):
         return self.core.list_atomic_tasks()
@@ -448,8 +529,8 @@ class AgenticBridgeServer(BaseInferenceServer):
 def parse_args():
     parser = argparse.ArgumentParser(description="RoboCasa + GR00T bridge server for agentic workflow")
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--env_name", type=str, default="RinseSinkBasin")
-    parser.add_argument("--split", type=str, default="target", choices=["pretrain", "target"])
+    parser.add_argument("--env_name", type=str, default=None, help="Optional startup env; if omitted, simulator launches lazily from UI/API")
+    parser.add_argument("--split", type=str, default="target", choices=["pretrain", "target", "custom"])
     parser.add_argument("--data_config", type=str, default="panda_omron")
     parser.add_argument("--embodiment_tag", type=str, default="new_embodiment")
     parser.add_argument("--denoising_steps", type=int, default=4)
@@ -463,6 +544,8 @@ def parse_args():
 def print_examples(host: str, port: int):
     print("\nBridge endpoint examples (Python client using BaseInferenceClient):")
     print("  client.call_endpoint('status', requires_input=False)")
+    print("  client.call_endpoint('list_available_envs', requires_input=False)")
+    print("  client.call_endpoint('list_scene_config', requires_input=False)")
     print("  client.call_endpoint('get_snapshot', requires_input=False)")
     print("  client.call_endpoint('reset', requires_input=False)")
     print("  client.call_endpoint('get_observation', requires_input=False)")
@@ -477,7 +560,7 @@ def print_examples(host: str, port: int):
 def main():
     args = parse_args()
     print(f"Loading policy from {args.model_path}")
-    print(f"Task: {args.env_name} | split={args.split} | n_action_steps={args.n_action_steps}")
+    print(f"Startup env: {args.env_name} | split={args.split} | n_action_steps={args.n_action_steps}")
     core = AgenticBridgeCore(args)
     server = AgenticBridgeServer(core=core, host=args.host, port=args.port)
     print_examples(args.host, args.port)
