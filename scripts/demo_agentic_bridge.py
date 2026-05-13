@@ -27,7 +27,7 @@ def _parse_streamlit_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8010)
-    parser.add_argument("--split", type=str, default="target")
+    parser.add_argument("--split", type=str, default="pretrain")
     parser.add_argument("--env_name", type=str, default="")
     parser.add_argument("--layout_id", type=str, default="")
     parser.add_argument("--style_id", type=str, default="")
@@ -156,7 +156,7 @@ def main():
     camera_columns = 3
     st.set_page_config(page_title="GR00T Bridge UI", layout="wide")
     st.title("GR00T Bridge UI")
-    st.caption("Launch env from UI, call skills/actions, and view latest observations.")
+    st.caption("API demo for launching a controlled RoboCasa scene, configuring the policy task description, and sending robot actions.")
 
     if "last_command_result" not in st.session_state:
         st.session_state["last_command_result"] = None
@@ -170,6 +170,10 @@ def main():
             "When to update observation?",
             options=["Get obs once action end", "Interval by env steps"],
             index=0,
+            help=(
+                "'Get obs once action end' updates the displayed observation after a clicked action finishes. "
+                "'Interval by env steps' periodically refreshes while the environment step counter changes."
+            ),
         )
         env_step_interval = st.slider(
             "Env step interval (0=every step, 1=every 2 steps)",
@@ -178,6 +182,7 @@ def main():
             0,
             1,
             disabled=(obs_mode == "Get obs once action end"),
+            help="Controls how often the UI replaces the displayed observation in interval mode.",
         )
         poll_interval_s = st.slider(
             "UI poll interval (seconds)",
@@ -186,13 +191,33 @@ def main():
             1.0,
             0.1,
             disabled=(obs_mode == "Get obs once action end"),
+            help="How often Streamlit asks the bridge for a fresh snapshot in interval mode.",
         )
-        auto_refresh = st.checkbox("Auto refresh", value=True, disabled=(obs_mode == "Get obs once action end"))
+        auto_refresh = st.checkbox(
+            "Auto refresh",
+            value=True,
+            disabled=(obs_mode == "Get obs once action end"),
+            help="When enabled, the page reruns automatically to fetch new bridge state.",
+        )
+
+        st.header("Run Settings")
+        max_steps = st.number_input(
+            "Max steps",
+            min_value=-1,
+            value=-1,
+            step=1,
+            help="-1 means no episode step limit. 0 means use RoboCasa's default horizon for the selected task. Positive values set an explicit limit.",
+        )
 
         st.header("Display")
-        image_width = st.selectbox("Image width", options=["stretch", "content"], index=0)
+        image_width = st.selectbox(
+            "Image width",
+            options=["stretch", "content"],
+            index=0,
+            help="'stretch' fills the available column width. 'content' keeps the image closer to its natural display size.",
+        )
 
-        if st.button("Refresh now", width="stretch"):
+        if st.button("Refresh now", width="stretch", help="Immediately fetch and display the latest bridge snapshot."):
             st.rerun()
 
     # Load registry info
@@ -204,77 +229,6 @@ def main():
     except Exception:
         pass
 
-    # Environment launch panel
-    st.subheader("1) Launch / Configure Environment")
-    e1, e2, e3, e4 = st.columns([2, 1, 1, 1])
-    all_tasks = envs_info.get("all_tasks", [])
-    default_env = cli.env_name if cli.env_name else ("RinseSinkBasin" if "RinseSinkBasin" in all_tasks else (all_tasks[0] if all_tasks else ""))
-    with e1:
-        env_name = st.selectbox("Task / Env Name", options=all_tasks or [default_env], index=(all_tasks.index(default_env) if default_env in all_tasks else 0))
-    with e2:
-        split = st.selectbox("Split", options=scene_info.get("split_options", ["target", "pretrain", "custom"]), index=0 if cli.split not in scene_info.get("split_options", []) else scene_info.get("split_options", []).index(cli.split))
-    split_ranges = scene_info.get(
-        "split_layout_style_ranges",
-        {"target": [1, 10], "pretrain": [11, 60], "custom": [1, 60]},
-    )
-    range_for_split = split_ranges.get(split, [1, 60])
-    layout_min, layout_max = int(range_for_split[0]), int(range_for_split[1])
-    style_min, style_max = int(range_for_split[0]), int(range_for_split[1])
-    split_is_custom = split == "custom"
-    with e3:
-        use_layout_id = st.checkbox(
-            "Set layout id",
-            value=(bool(cli.layout_id.strip()) and split_is_custom),
-            disabled=not split_is_custom,
-        )
-        layout_id_value = st.number_input(
-            f"Layout id ({layout_min}-{layout_max})",
-            min_value=int(layout_min),
-            max_value=int(layout_max),
-            value=int(cli.layout_id) if cli.layout_id.strip() else int(layout_min),
-            step=1,
-            disabled=not use_layout_id,
-        )
-    with e4:
-        use_style_id = st.checkbox(
-            "Set style id",
-            value=(bool(cli.style_id.strip()) and split_is_custom),
-            disabled=not split_is_custom,
-        )
-        style_id_value = st.number_input(
-            f"Style id ({style_min}-{style_max})",
-            min_value=int(style_min),
-            max_value=int(style_max),
-            value=int(cli.style_id) if cli.style_id.strip() else int(style_min),
-            step=1,
-            disabled=not use_style_id,
-        )
-
-    if split_is_custom:
-        st.caption("If layout/style is not set, RoboCasa samples one automatically.")
-    else:
-        st.caption(f"For split `{split}`, RoboCasa uses its predefined scene split; explicit layout/style overrides are disabled.")
-
-    max_steps = st.number_input("Max steps (0=task default)", min_value=0, value=0, step=1)
-    c_launch, c_reset = st.columns(2)
-    with c_launch:
-        if st.button("Launch / Apply Environment", width="stretch"):
-            payload: Dict[str, Any] = {"env_name": env_name, "split": split}
-            if max_steps > 0:
-                payload["max_steps"] = int(max_steps)
-            if use_layout_id:
-                payload["layout_id"] = int(layout_id_value)
-            if use_style_id:
-                payload["style_id"] = int(style_id_value)
-            _send_command(host, port, command_timeout_ms, "configure_environment", payload)
-            st.rerun()
-    with c_reset:
-        if st.button("Reset Episode", width="stretch"):
-            _send_command(host, port, command_timeout_ms, "reset")
-            st.rerun()
-
-    # Command panel
-    st.subheader("2) Actions / Skills")
     snapshot = None
     fetch_error = None
     try:
@@ -292,87 +246,209 @@ def main():
     display_snapshot = st.session_state.get("display_snapshot", snapshot)
     status = display_snapshot.get("status", {})
     obs = display_snapshot.get("observation")
-    skills = display_snapshot.get("skills", {"skills": []})
 
-    a1, a2 = st.columns([1, 1])
-    with a1:
-        st.write("**Base Move**")
-        magnitude = st.slider("Magnitude", 0.0, 1.0, 0.5, 0.05)
+    left, right = st.columns([0.9, 1.35], gap="large")
+
+    with left:
+        st.subheader("1) Launch / Configure Environment")
+        all_tasks = envs_info.get("all_tasks", [])
+        default_env = cli.env_name if cli.env_name else ("RinseSinkBasin" if "RinseSinkBasin" in all_tasks else (all_tasks[0] if all_tasks else ""))
+        env_name = st.selectbox(
+            "Task / Env Name",
+            options=all_tasks or [default_env],
+            index=(all_tasks.index(default_env) if default_env in all_tasks else 0),
+            help="The RoboCasa task/environment to launch, such as RinseSinkBasin or OpenDrawer.",
+        )
+        split_options = scene_info.get("split_options", ["target", "pretrain", "custom"])
+        split = st.selectbox(
+            "Split",
+            options=split_options,
+            index=0 if cli.split not in split_options else split_options.index(cli.split),
+            help=(
+                "RoboCasa scene split. pretrain uses train/pretraining scenes and is usually easier for released policies. "
+                "target uses held-out target/test scenes for generalization. custom lets you manually set layout/style IDs."
+            ),
+        )
+        split_ranges = scene_info.get(
+            "split_layout_style_ranges",
+            {"target": [1, 10], "pretrain": [11, 60], "custom": [1, 60]},
+        )
+        range_for_split = split_ranges.get(split, [1, 60])
+        layout_min, layout_max = int(range_for_split[0]), int(range_for_split[1])
+        style_min, style_max = int(range_for_split[0]), int(range_for_split[1])
+        split_is_custom = split == "custom"
+
+        id_cols = st.columns(2)
+        with id_cols[0]:
+            use_layout_id = st.checkbox(
+                "Set layout id",
+                value=(bool(cli.layout_id.strip()) and split_is_custom),
+                disabled=not split_is_custom,
+                help="Enable this only with custom split to reproduce a specific kitchen layout.",
+            )
+            layout_id_value = st.number_input(
+                f"Layout id ({layout_min}-{layout_max})",
+                min_value=int(layout_min),
+                max_value=int(layout_max),
+                value=int(cli.layout_id) if cli.layout_id.strip() else int(layout_min),
+                step=1,
+                disabled=not use_layout_id,
+                help="RoboCasa kitchen layout ID. The valid range depends on the selected split.",
+            )
+        with id_cols[1]:
+            use_style_id = st.checkbox(
+                "Set style id",
+                value=(bool(cli.style_id.strip()) and split_is_custom),
+                disabled=not split_is_custom,
+                help="Enable this only with custom split to reproduce a specific kitchen visual/object style.",
+            )
+            style_id_value = st.number_input(
+                f"Style id ({style_min}-{style_max})",
+                min_value=int(style_min),
+                max_value=int(style_max),
+                value=int(cli.style_id) if cli.style_id.strip() else int(style_min),
+                step=1,
+                disabled=not use_style_id,
+                help="RoboCasa kitchen style ID. The valid range depends on the selected split.",
+            )
+
+        c_launch, c_reset = st.columns(2)
+        with c_launch:
+            if st.button("Launch / Apply Environment", width="stretch", help="Create or recreate the simulator with the selected task, split, scene IDs, and run settings."):
+                payload: Dict[str, Any] = {"env_name": env_name, "split": split}
+                payload["max_steps"] = int(max_steps)
+                if use_layout_id:
+                    payload["layout_id"] = int(layout_id_value)
+                if use_style_id:
+                    payload["style_id"] = int(style_id_value)
+                _send_command(host, port, command_timeout_ms, "configure_environment", payload)
+                st.rerun()
+        with c_reset:
+            if st.button("Reset Episode", width="stretch", help="Reset the current simulator episode without changing the selected environment configuration."):
+                _send_command(host, port, command_timeout_ms, "reset")
+                st.rerun()
+
+        st.subheader("2) Actions / Policy Configure")
+        st.write("**Policy Configure**")
+        policy_skills = []
+        try:
+            skill_resp = _bridge_call(
+                host,
+                port,
+                "list_policy_skills",
+                requires_input=False,
+                timeout_ms=snapshot_timeout_ms,
+            )
+            policy_skills = skill_resp.get("skills", [])
+        except Exception:
+            policy_skills = []
+
+        atomic_tasks = envs_info.get("atomic_tasks", [])
+        skill_names = [skill.get("name", "") for skill in policy_skills if skill.get("name")]
+        if not skill_names:
+            skill_names = atomic_tasks
+        default_atomic = status.get("env_name") if status.get("env_name") in skill_names else (skill_names[0] if skill_names else "")
+        selected_skill = st.selectbox(
+            "Skill / Atomic task",
+            options=skill_names or [default_atomic],
+            index=(skill_names.index(default_atomic) if default_atomic in skill_names else 0),
+            help="Select the atomic RoboCasa skill/task. The bridge resolves this name to the task description sent to GR00T.",
+        )
+        resolved_skill = next((skill for skill in policy_skills if skill.get("name") == selected_skill), None)
+        if resolved_skill is None and selected_skill:
+            try:
+                resolved_skill = _bridge_call(
+                    host,
+                    port,
+                    "resolve_skill_description",
+                    {"name": selected_skill},
+                    requires_input=True,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+            except Exception:
+                resolved_skill = {"name": selected_skill, "description": selected_skill, "source": "fallback_task_name", "is_template": False}
+        policy_description = (resolved_skill or {}).get("description", selected_skill)
+        st.text_area(
+            "Resolved task description sent to GR00T",
+            value=policy_description or "",
+            height=90,
+            disabled=True,
+            help="Read-only. This is the language instruction that will be sent to GR00T when Execute Policy is clicked.",
+        )
+        st.caption(
+            f"Description source: `{(resolved_skill or {}).get('source', 'unknown')}`"
+            + (" | template contains unresolved choices" if (resolved_skill or {}).get("is_template") else "")
+        )
+
+        magnitude = st.slider(
+            "Base move magnitude",
+            0.0,
+            1.0,
+            0.5,
+            0.05,
+            help="Normalized base motion amount for forward/backward/turn actions.",
+        )
+        policy_repeat = st.number_input(
+            "Policy repeat",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            help="How many GR00T policy steps to execute with the configured task description.",
+        )
+
+        st.write("**Actions**")
         m1, m2 = st.columns(2)
         with m1:
-            if st.button("Forward", width="stretch"):
+            if st.button("Forward", width="stretch", help="Move the robot base forward in the current environment."):
                 _send_command(host, port, command_timeout_ms, "move", {"command": "forward", "magnitude": float(magnitude), "repeat": 1})
                 st.rerun()
-            if st.button("Turn Left", width="stretch"):
+            if st.button("Turn Left", width="stretch", help="Rotate the robot base left in the current environment."):
                 _send_command(host, port, command_timeout_ms, "move", {"command": "turn_left", "magnitude": float(magnitude), "repeat": 1})
                 st.rerun()
         with m2:
-            if st.button("Backward", width="stretch"):
+            if st.button("Backward", width="stretch", help="Move the robot base backward in the current environment."):
                 _send_command(host, port, command_timeout_ms, "move", {"command": "backward", "magnitude": float(magnitude), "repeat": 1})
                 st.rerun()
-            if st.button("Turn Right", width="stretch"):
+            if st.button("Turn Right", width="stretch", help="Rotate the robot base right in the current environment."):
                 _send_command(host, port, command_timeout_ms, "move", {"command": "turn_right", "magnitude": float(magnitude), "repeat": 1})
                 st.rerun()
-
-    with a2:
-        st.write("**Policy Call**")
-        all_skills = skills.get("skills", []) or ["policy_step"]
-        base_move_skills = {"move_forward", "move_backward", "turn_left", "turn_right"}
-        policy_skills = [s for s in all_skills if s not in base_move_skills]
-        if len(policy_skills) == 0:
-            policy_skills = ["policy_step"]
-        skill_name = st.selectbox("Policy skill", options=policy_skills)
-        policy_description = None
-        if skill_name == "policy_step":
-            desc_options = []
-            try:
-                desc_resp = _bridge_call(
-                    host,
-                    port,
-                    "list_policy_descriptions",
-                    requires_input=False,
-                    timeout_ms=snapshot_timeout_ms,
-                )
-                desc_options = desc_resp.get("policy_descriptions", [])
-            except Exception:
-                desc_options = []
-            desc_source = st.selectbox(
-                "Policy description source",
-                options=["Use env instruction", "Use task name", "Custom text"],
-                index=0,
+        if st.button("Execute Policy", width="stretch", help="Run the GR00T policy using the task description configured above."):
+            _send_command(
+                host,
+                port,
+                command_timeout_ms,
+                "call_skill",
+                {"name": selected_skill, "params": {"repeat": int(policy_repeat)}},
             )
-            if desc_source == "Custom text":
-                policy_description = st.text_input("Custom description", value="")
-            elif desc_source == "Use task name":
-                policy_description = status.get("env_name")
-            else:
-                policy_description = desc_options[0] if len(desc_options) > 0 else None
-        if st.button("Step Policy", width="stretch"):
-            params: Dict[str, Any] = {}
-            if skill_name == "policy_step" and policy_description is not None:
-                params["description"] = policy_description
-            _send_command(host, port, command_timeout_ms, "call_skill", {"name": skill_name, "params": params})
             st.rerun()
 
-    st.subheader("3) Status / Observation")
-    s1, s2 = st.columns([1, 2])
-    with s2:
+    with right:
+        st.subheader("3) Status / Observation")
         if not status.get("env_ready", False):
-            st.info("Simulator not launched yet. Configure environment above and click 'Launch / Apply Environment'.")
+            st.info("Simulator not launched yet. Configure environment on the left and click 'Launch / Apply Environment'.")
         elif obs is None:
             st.warning("No observation available yet.")
         else:
-            video_keys = sorted([k for k in obs.keys() if k.startswith("video.")])
+            cameras = obs.get("cameras", {}) if isinstance(obs, dict) else {}
+            if cameras:
+                video_items = sorted(cameras.items())
+            else:
+                video_items = sorted((k, obs[k]) for k in obs.keys() if k.startswith("video."))
+            video_keys = [key for key, _ in video_items]
             cols = st.columns(max(1, min(camera_columns, len(video_keys) if len(video_keys) > 0 else 1)))
-            for idx, key in enumerate(video_keys):
+            for idx, (key, value) in enumerate(video_items):
                 try:
-                    frame = _pick_frame(obs[key])
+                    frame = _pick_frame(value)
                     cols[idx % len(cols)].image(frame, caption=key, channels="RGB", width=image_width)
                 except Exception as exc:
                     cols[idx % len(cols)].warning(f"{key}: {exc}")
 
-    with s1:
+        st.write("**Status**")
         st.json(_to_jsonable(status))
+        if isinstance(obs, dict) and obs.get("robot_state") is not None:
+            st.write("**Robot state**")
+            st.json(_to_jsonable(obs["robot_state"]))
         if st.session_state["last_command_result"] is not None:
             st.write("**Last command result**")
             st.json(_to_jsonable(st.session_state["last_command_result"]))

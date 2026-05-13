@@ -24,11 +24,14 @@ Example:
       --model_path ../checkpoint-60000/gr00t_n1-5/foundation_model_learning/target_posttraining/composite_seen/checkpoint-60000 \
       --env_name RinseSinkBasin \
       --split target \
-      --port 8010
+      --port 8010 \
+      --headless
 """
 
 import argparse
+import json
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import gymnasium as gym
@@ -50,7 +53,82 @@ from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
 from robocasa.utils.dataset_registry_utils import get_task_horizon
 
 
-def _make_single_env(env_name: str, split: str, n_action_steps: int, max_episode_steps: int):
+DEFAULT_CAMERA_KEYS = [
+    "video.robot0_agentview_left",
+    "video.robot0_agentview_right",
+    "video.robot0_eye_in_hand",
+]
+
+DEFAULT_ROBOT_STATE_KEYS = [
+    "state.end_effector_position_relative",
+    "state.end_effector_rotation_relative",
+    "state.gripper_qpos",
+    "state.base_position",
+    "state.base_rotation",
+]
+
+
+def _latest_value(value: Any) -> Any:
+    arr = np.asarray(value)
+    if arr.ndim >= 2:
+        return arr[0, -1]
+    if arr.ndim == 1:
+        return arr
+    return value
+
+
+def _array_to_list(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _scene_id_to_json(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _resolve_max_steps(env_name: str, max_steps: Optional[int]) -> Optional[int]:
+    if max_steps is None or int(max_steps) == 0:
+        return get_task_horizon(env_name)
+    if int(max_steps) < 0:
+        return None
+    return int(max_steps)
+
+
+def _load_task_attribute_descriptions() -> Dict[str, str]:
+    candidate_paths = [
+        Path.cwd().parent / "robocasa" / "docs" / "composite_tasks" / "task_attributes.json",
+        Path(robocasa.__path__[0]).parent / "docs" / "composite_tasks" / "task_attributes.json",
+        Path(robocasa.__path__[0]).parent.parent / "docs" / "composite_tasks" / "task_attributes.json",
+    ]
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                task["name"]: task.get("description", "")
+                for task in data.get("tasks", [])
+                if task.get("name")
+            }
+        except Exception:
+            continue
+    return {}
+
+
+def _make_single_env(env_name: str, split: str, n_action_steps: int, max_episode_steps: Optional[int]):
     def _make():
         env_kwargs = {"enable_render": True}
         split_arg = split
@@ -90,8 +168,12 @@ class AgenticBridgeCore:
         self.last_reward = 0.0
         self.last_info: Dict[str, Any] = {}
         self.last_obs: Optional[Dict[str, Any]] = None
+        self.last_skill_call: Optional[Dict[str, Any]] = None
 
         data_config = DATA_CONFIG_MAP[args.data_config]
+        self.camera_keys = list(getattr(data_config, "video_keys", DEFAULT_CAMERA_KEYS))
+        self.robot_state_keys = list(getattr(data_config, "state_keys", DEFAULT_ROBOT_STATE_KEYS))
+        self.task_attribute_descriptions = _load_task_attribute_descriptions()
         self.policy = Gr00tPolicy(
             model_path=args.model_path,
             modality_config=data_config.modality_config(),
@@ -115,7 +197,7 @@ class AgenticBridgeCore:
 
         # Optional startup env can be provided, but default behavior is lazy launch.
         if self.env_name:
-            init_max_steps = self.max_steps or get_task_horizon(self.env_name)
+            init_max_steps = _resolve_max_steps(self.env_name, self.max_steps)
             self._rebuild_env(self.env_name, self.split, init_max_steps)
             self.reset()
 
@@ -130,7 +212,7 @@ class AgenticBridgeCore:
         self,
         env_name: str,
         split: str,
-        max_steps: int,
+        max_steps: Optional[int],
         layout_id: Optional[int] = None,
         style_id: Optional[int] = None,
     ):
@@ -147,7 +229,7 @@ class AgenticBridgeCore:
             raise ValueError("layout/style overrides require split='custom'")
         self.env_name = env_name
         self.split = split
-        self.max_steps = int(max_steps)
+        self.max_steps = None if max_steps is None else int(max_steps)
         self.layout_id = layout_id
         self.style_id = style_id
         env_fn = _make_single_env(self.env_name, self.split, self.args.n_action_steps, self.max_steps)
@@ -181,6 +263,8 @@ class AgenticBridgeCore:
             raise RuntimeError("Simulator is not launched. Call configure_environment first.")
 
     def _render_update(self):
+        if self.args.headless:
+            return
         if self.rs_env is None:
             return
         if self.rs_env is not None and hasattr(self.rs_env, "viewer") and self.rs_env.viewer is not None:
@@ -193,6 +277,85 @@ class AgenticBridgeCore:
         self.step_count += 1
         success_flags = info.get("success", [[False]])
         self.success = bool(any(s for s in success_flags[0]))
+
+    def _task_instruction(self) -> Optional[str]:
+        if self.last_obs is None:
+            return None
+        annotation = self.last_obs.get("annotation.human.task_description")
+        if annotation is None:
+            annotation = self.last_obs.get("annotation.human.action.task_description")
+        if annotation is None:
+            return None
+        if isinstance(annotation, np.ndarray):
+            annotation = annotation.flatten()[0]
+        elif isinstance(annotation, (tuple, list)) and len(annotation) > 0:
+            annotation = annotation[0]
+        return str(annotation)
+
+    def _scene_state(self) -> Dict[str, Any]:
+        actual_layout_id = self.layout_id
+        actual_style_id = self.style_id
+        if self.rs_env is not None:
+            actual_layout_id = getattr(self.rs_env, "layout_id", actual_layout_id)
+            actual_style_id = getattr(self.rs_env, "style_id", actual_style_id)
+        return {
+            "env_name": self.env_name,
+            "split": self.split,
+            "layout_id": _scene_id_to_json(actual_layout_id),
+            "style_id": _scene_id_to_json(actual_style_id),
+            "requested_layout_id": self.layout_id,
+            "requested_style_id": self.style_id,
+            "max_steps": self.max_steps,
+            "n_action_steps": self.args.n_action_steps,
+        }
+
+    def _sim_joint_state(self) -> Dict[str, Any]:
+        if self.rs_env is None or not hasattr(self.rs_env, "sim"):
+            return {}
+        out: Dict[str, Any] = {}
+        try:
+            out["qpos"] = np.asarray(self.rs_env.sim.data.qpos).copy().tolist()
+        except Exception:
+            pass
+        try:
+            out["qvel"] = np.asarray(self.rs_env.sim.data.qvel).copy().tolist()
+        except Exception:
+            pass
+        try:
+            robot = self.rs_env.robots[0]
+            joint_indexes = getattr(robot, "_ref_joint_pos_indexes", None)
+            if joint_indexes is None:
+                joint_indexes = getattr(robot, "joint_indexes", None)
+            if joint_indexes is not None:
+                qpos = np.asarray(self.rs_env.sim.data.qpos)
+                out["robot_joint_positions"] = qpos[np.asarray(joint_indexes, dtype=int)].tolist()
+        except Exception:
+            pass
+        return out
+
+    def robot_state(self) -> Dict[str, Any]:
+        self._ensure_env_ready()
+        if self.last_obs is None:
+            raise RuntimeError("No observation available. Call reset first.")
+
+        observed_state = {}
+        for key in self.robot_state_keys:
+            if key in self.last_obs:
+                observed_state[key] = _array_to_list(_latest_value(self.last_obs[key]))
+
+        return {
+            "base_pose": {
+                "position": observed_state.get("state.base_position"),
+                "rotation": observed_state.get("state.base_rotation"),
+            },
+            "end_effector_pose_relative": {
+                "position": observed_state.get("state.end_effector_position_relative"),
+                "rotation": observed_state.get("state.end_effector_rotation_relative"),
+            },
+            "gripper_qpos": observed_state.get("state.gripper_qpos"),
+            "observed_state": observed_state,
+            "simulator_joint_state": self._sim_joint_state(),
+        }
 
     def _coerce_action(self, action: Dict[str, Any]) -> Dict[str, np.ndarray]:
         out: Dict[str, np.ndarray] = {}
@@ -234,24 +397,18 @@ class AgenticBridgeCore:
 
     def status(self) -> Dict[str, Any]:
         out = {
-            "env_name": self.env_name,
-            "split": self.split,
+            **self._scene_state(),
             "env_ready": self.vec_env is not None,
             "step_count": self.step_count,
-            "max_steps": self.max_steps,
-            "n_action_steps": self.args.n_action_steps,
-            "layout_id": self.layout_id,
-            "style_id": self.style_id,
             "done": self.done,
             "success": self.success,
             "last_reward": self.last_reward,
+            "last_skill_call": self.last_skill_call,
             "timestamp": time.time(),
         }
-        if self.last_obs is not None:
-            annotation = self.last_obs.get("annotation.human.task_description", ["N/A"])
-            if isinstance(annotation, np.ndarray):
-                annotation = annotation[0]
-            out["task_instruction"] = annotation
+        task_instruction = self._task_instruction()
+        if task_instruction is not None:
+            out["task_instruction"] = task_instruction
         return out
 
     def reset(self) -> Dict[str, Any]:
@@ -264,7 +421,8 @@ class AgenticBridgeCore:
 
         obs, _ = self.vec_env.reset()
         self.last_obs = obs
-        self.rs_env.initialize_renderer()
+        if not self.args.headless:
+            self.rs_env.initialize_renderer()
         self._render_update()
         return self.status()
 
@@ -282,7 +440,7 @@ class AgenticBridgeCore:
         new_split = split or self.split
         if new_split not in ("pretrain", "target", "custom"):
             raise ValueError("split must be pretrain, target, or custom")
-        new_max_steps = int(max_steps) if max_steps is not None else get_task_horizon(new_env_name)
+        new_max_steps = _resolve_max_steps(new_env_name, max_steps)
         self._rebuild_env(new_env_name, new_split, new_max_steps, layout_id=layout_id, style_id=style_id)
         return self.reset()
 
@@ -315,9 +473,72 @@ class AgenticBridgeCore:
             },
         }
 
+    def list_viable_skills(self) -> Dict[str, Any]:
+        actions = [
+            {
+                "name": "move_forward",
+                "type": "base_control",
+                "description": "Move the robot base forward in the current environment.",
+                "params": {"magnitude": "float in [0, 1]", "repeat": "int optional"},
+                "keeps_current_environment": True,
+                "executable": True,
+            },
+            {
+                "name": "move_backward",
+                "type": "base_control",
+                "description": "Move the robot base backward in the current environment.",
+                "params": {"magnitude": "float in [0, 1]", "repeat": "int optional"},
+                "keeps_current_environment": True,
+                "executable": True,
+            },
+            {
+                "name": "turn_left",
+                "type": "base_control",
+                "description": "Rotate the robot base left in the current environment.",
+                "params": {"magnitude": "float in [0, 1]", "repeat": "int optional"},
+                "keeps_current_environment": True,
+                "executable": True,
+            },
+            {
+                "name": "turn_right",
+                "type": "base_control",
+                "description": "Rotate the robot base right in the current environment.",
+                "params": {"magnitude": "float in [0, 1]", "repeat": "int optional"},
+                "keeps_current_environment": True,
+                "executable": True,
+            },
+            {
+                "name": "execute_policy",
+                "type": "policy_control",
+                "description": "Run the configured GR00T policy once in the current environment.",
+                "endpoint": "step_policy",
+                "params": {"repeat": "int optional", "description": "str optional policy config"},
+                "keeps_current_environment": True,
+                "executable": True,
+            },
+        ]
+        actions.extend(
+            {
+                "name": name,
+                "type": "external",
+                "description": "Registered external skill name. The bridge lists it but does not execute it locally.",
+                "params": {},
+                "keeps_current_environment": True,
+                "executable": False,
+            }
+            for name, meta in self.skills.items()
+            if meta.get("type") == "external"
+        )
+        return {
+            "actions": actions,
+            # Backward-compatible alias for older demo clients.
+            "skills": actions,
+            "policy_description_candidates": self.list_policy_descriptions()["policy_descriptions"],
+        }
+
     def list_policy_descriptions(self) -> Dict[str, Any]:
         candidates = []
-        task_instruction = self.status().get("task_instruction")
+        task_instruction = self._task_instruction()
         if task_instruction is not None:
             if isinstance(task_instruction, (tuple, list)) and len(task_instruction) > 0:
                 candidates.append(str(task_instruction[0]))
@@ -328,14 +549,47 @@ class AgenticBridgeCore:
         deduped = list(dict.fromkeys([c for c in candidates if c]))
         return {"policy_descriptions": deduped}
 
+    def resolve_skill_description(self, name: str) -> Dict[str, Any]:
+        if name == self.env_name:
+            task_instruction = self._task_instruction()
+            if task_instruction:
+                return {
+                    "name": name,
+                    "description": task_instruction,
+                    "source": "current_environment_episode_language",
+                    "is_template": False,
+                }
+
+        description = self.task_attribute_descriptions.get(name)
+        if description:
+            return {
+                "name": name,
+                "description": description,
+                "source": "robocasa/docs/composite_tasks/task_attributes.json",
+                "is_template": "{" in description and "}" in description,
+            }
+
+        return {
+            "name": name,
+            "description": name,
+            "source": "fallback_task_name",
+            "is_template": False,
+        }
+
+    def list_policy_skills(self) -> Dict[str, Any]:
+        atomic_tasks = list(TASK_SET_REGISTRY.get("all_atomic_tasks", []))
+        return {
+            "skills": [self.resolve_skill_description(name) for name in atomic_tasks],
+        }
+
     def snapshot(self) -> Dict[str, Any]:
         observation = None
         if self.vec_env is not None and self.last_obs is not None:
-            observation = self.get_observation()
+            observation = self.agent_observation()
         return {
             "status": self.status(),
             "observation": observation,
-            "skills": {"skills": list(self.skills.keys()) + list(TASK_SET_REGISTRY.get("all_atomic_tasks", []))},
+            "skills": self.list_viable_skills(),
         }
 
     def get_observation(self) -> Dict[str, Any]:
@@ -343,6 +597,28 @@ class AgenticBridgeCore:
         if self.last_obs is None:
             raise RuntimeError("No observation available. Call reset first.")
         return self.last_obs
+
+    def agent_observation(self) -> Dict[str, Any]:
+        self._ensure_env_ready()
+        if self.last_obs is None:
+            raise RuntimeError("No observation available. Call reset first.")
+
+        cameras = {}
+        available_video_keys = [key for key in self.last_obs if key.startswith("video.")]
+        camera_keys = [key for key in self.camera_keys if key in self.last_obs]
+        if not camera_keys:
+            camera_keys = sorted(available_video_keys)[:3]
+        for key in camera_keys[:3]:
+            cameras[key] = _latest_value(self.last_obs[key])
+
+        return {
+            "scene": self._scene_state(),
+            "task_instruction": self._task_instruction(),
+            "robot_state": self.robot_state(),
+            "cameras": cameras,
+            "viable_skills": self.list_viable_skills()["skills"],
+            "policy_skills": self.list_policy_skills()["skills"],
+        }
 
     def step_action(self, action: Dict[str, Any], repeat: int = 1) -> Dict[str, Any]:
         self._ensure_env_ready()
@@ -407,6 +683,7 @@ class AgenticBridgeCore:
 
     def call_skill(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = params or {}
+        self.last_skill_call = {"name": name, "params": params, "timestamp": time.time()}
         if name == "policy_step":
             return self.step_policy(
                 repeat=int(params.get("repeat", 1)),
@@ -420,12 +697,12 @@ class AgenticBridgeCore:
             return self.move("turn_left", float(params.get("magnitude", 0.5)), int(params.get("repeat", 1)))
         if name == "turn_right":
             return self.move("turn_right", float(params.get("magnitude", 0.5)), int(params.get("repeat", 1)))
-        # Allow atomic task names as "potential skill list":
-        # selecting one switches environment and uses that task's default language condition.
         if name in TASK_SET_REGISTRY.get("all_atomic_tasks", []):
-            split = str(params.get("split", self.split))
-            max_steps = params.get("max_steps", None)
-            return self.configure_environment(env_name=name, split=split, max_steps=max_steps)
+            resolved = self.resolve_skill_description(name)
+            return self.step_policy(
+                repeat=int(params.get("repeat", 1)),
+                description=str(params.get("description", resolved["description"])),
+            )
         raise ValueError(f"Skill '{name}' not implemented in bridge yet")
 
 
@@ -437,13 +714,18 @@ class AgenticBridgeServer(BaseInferenceServer):
         self.register_endpoint("get_snapshot", self._get_snapshot, requires_input=False)
         self.register_endpoint("reset", self._reset, requires_input=False)
         self.register_endpoint("get_observation", self._get_observation, requires_input=False)
+        self.register_endpoint("get_agent_observation", self._get_agent_observation, requires_input=False)
+        self.register_endpoint("get_robot_state", self._get_robot_state, requires_input=False)
         self.register_endpoint("step_policy", self._step_policy, requires_input=True)
         self.register_endpoint("step_action", self._step_action, requires_input=True)
         self.register_endpoint("move", self._move, requires_input=True)
         self.register_endpoint("list_skills", self._list_skills, requires_input=False)
+        self.register_endpoint("list_viable_skills", self._list_viable_skills, requires_input=False)
         self.register_endpoint("list_available_envs", self._list_available_envs, requires_input=False)
         self.register_endpoint("list_scene_config", self._list_scene_config, requires_input=False)
         self.register_endpoint("list_policy_descriptions", self._list_policy_descriptions, requires_input=False)
+        self.register_endpoint("list_policy_skills", self._list_policy_skills, requires_input=False)
+        self.register_endpoint("resolve_skill_description", self._resolve_skill_description, requires_input=True)
         self.register_endpoint("list_atomic_tasks", self._list_atomic_tasks, requires_input=False)
         self.register_endpoint("list_composite_tasks", self._list_composite_tasks, requires_input=False)
         self.register_endpoint("configure_environment", self._configure_environment, requires_input=True)
@@ -458,6 +740,12 @@ class AgenticBridgeServer(BaseInferenceServer):
 
     def _get_observation(self):
         return self.core.get_observation()
+
+    def _get_agent_observation(self):
+        return self.core.agent_observation()
+
+    def _get_robot_state(self):
+        return self.core.robot_state()
 
     def _step_policy(self, data: Dict[str, Any]):
         repeat = int(data.get("repeat", 1))
@@ -479,7 +767,10 @@ class AgenticBridgeServer(BaseInferenceServer):
         return self.core.move(command=command, magnitude=magnitude, repeat=repeat)
 
     def _list_skills(self):
-        return {"skills": list(self.core.skills.keys()) + list(TASK_SET_REGISTRY.get("all_atomic_tasks", []))}
+        return self.core.list_viable_skills()
+
+    def _list_viable_skills(self):
+        return self.core.list_viable_skills()
 
     def _list_available_envs(self):
         return self.core.list_available_envs()
@@ -489,6 +780,15 @@ class AgenticBridgeServer(BaseInferenceServer):
 
     def _list_policy_descriptions(self):
         return self.core.list_policy_descriptions()
+
+    def _list_policy_skills(self):
+        return self.core.list_policy_skills()
+
+    def _resolve_skill_description(self, data: Dict[str, Any]):
+        name = data.get("name")
+        if not isinstance(name, str):
+            raise ValueError("Missing 'name' in request")
+        return self.core.resolve_skill_description(name)
 
     def _list_atomic_tasks(self):
         return self.core.list_atomic_tasks()
@@ -535,9 +835,10 @@ def parse_args():
     parser.add_argument("--embodiment_tag", type=str, default="new_embodiment")
     parser.add_argument("--denoising_steps", type=int, default=4)
     parser.add_argument("--n_action_steps", type=int, default=16)
-    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--max_steps", type=int, default=None, help="-1 means no step limit, 0 means RoboCasa default task horizon")
     parser.add_argument("--host", type=str, default="*")
     parser.add_argument("--port", type=int, default=8010)
+    parser.add_argument("--headless", action="store_true", help="Run without opening the MuJoCo viewer GUI")
     return parser.parse_args()
 
 
@@ -547,12 +848,15 @@ def print_examples(host: str, port: int):
     print("  client.call_endpoint('list_available_envs', requires_input=False)")
     print("  client.call_endpoint('list_scene_config', requires_input=False)")
     print("  client.call_endpoint('get_snapshot', requires_input=False)")
+    print("  client.call_endpoint('get_agent_observation', requires_input=False)")
+    print("  client.call_endpoint('get_robot_state', requires_input=False)")
+    print("  client.call_endpoint('list_viable_skills', requires_input=False)")
     print("  client.call_endpoint('reset', requires_input=False)")
-    print("  client.call_endpoint('get_observation', requires_input=False)")
-    print("  client.call_endpoint('list_atomic_tasks', requires_input=False)")
+    print("  client.call_endpoint('get_observation', requires_input=False)  # raw policy observation")
     print("  client.call_endpoint('configure_environment', {'env_name': 'OpenDrawer', 'split': 'target'})")
     print("  client.call_endpoint('move', {'command': 'forward', 'magnitude': 0.5, 'repeat': 1})")
     print("  client.call_endpoint('step_policy', {'repeat': 1})")
+    print("  client.call_endpoint('call_skill', {'name': 'OpenDrawer', 'params': {'repeat': 1}})")
     print("  client.call_endpoint('call_skill', {'name': 'turn_left', 'params': {'magnitude': 0.5}})")
     print(f"\nServer binding: tcp://{host}:{port}\n")
 
@@ -560,7 +864,8 @@ def print_examples(host: str, port: int):
 def main():
     args = parse_args()
     print(f"Loading policy from {args.model_path}")
-    print(f"Startup env: {args.env_name} | split={args.split} | n_action_steps={args.n_action_steps}")
+    mode = "headless" if args.headless else "viewer"
+    print(f"Startup env: {args.env_name} | split={args.split} | n_action_steps={args.n_action_steps} | mode={mode}")
     core = AgenticBridgeCore(args)
     server = AgenticBridgeServer(core=core, host=args.host, port=args.port)
     print_examples(args.host, args.port)

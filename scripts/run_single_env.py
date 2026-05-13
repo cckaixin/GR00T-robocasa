@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Run a single robocasa environment with the MuJoCo viewer GUI,
-using a GR00T policy checkpoint to control the robot.
+Run a single RoboCasa environment with a GR00T policy checkpoint.
+By default this opens the MuJoCo viewer GUI; pass --headless for SSH/server runs.
 
 Uses the same environment wrappers as run_eval.py to ensure correct
 observation formatting for the policy.
@@ -55,7 +55,7 @@ def _get_robosuite_env(vec_env):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run a single env with MuJoCo viewer + GR00T policy")
+    parser = argparse.ArgumentParser(description="Run a single RoboCasa env with a GR00T policy")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--env_name", type=str, default="RinseSinkBasin")
     parser.add_argument("--split", type=str, default="target", choices=["pretrain", "target"])
@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--n_episodes", type=int, default=1)
     parser.add_argument("--fps", type=int, default=30, help="Target frame rate for viewer")
+    parser.add_argument("--headless", action="store_true", help="Run without opening the MuJoCo viewer GUI")
     args = parser.parse_args()
 
     max_steps = args.max_steps or get_task_horizon(args.env_name)
@@ -83,7 +84,8 @@ def main():
     )
 
     # -- Create env with SyncVectorEnv (n=1) + MultiStepWrapper --
-    print(f"Task: {args.env_name} | split: {args.split} | max_steps: {max_steps}")
+    mode = "headless" if args.headless else "viewer"
+    print(f"Task: {args.env_name} | split: {args.split} | max_steps: {max_steps} | mode: {mode}")
     print("Creating environment ...")
     env_fn = _make_single_env(args.env_name, args.split, args.n_action_steps, max_steps)
     vec_env = gym.vector.SyncVectorEnv([env_fn])
@@ -94,8 +96,9 @@ def main():
         print(f"\n=== Episode {ep + 1}/{args.n_episodes} ===")
         obs, info = vec_env.reset()
 
-        # Re-initialize the MuJoCo viewer after reset (reset destroys it)
-        rs_env.initialize_renderer()
+        if not args.headless:
+            # Re-initialize the MuJoCo viewer after reset (reset destroys it).
+            rs_env.initialize_renderer()
 
         annotation = obs.get("annotation.human.task_description", ["N/A"])
         if isinstance(annotation, np.ndarray):
@@ -112,14 +115,15 @@ def main():
             obs, reward, terminated, truncated, info = vec_env.step(action_dict)
             done = bool(terminated[0]) or bool(truncated[0])
 
-            # Update MuJoCo viewer (lazily launches the window on first call)
-            rs_env.viewer.update()
+            if not args.headless:
+                # Update MuJoCo viewer (lazily launches the window on first call).
+                rs_env.viewer.update()
 
-            # Frame rate limiting
-            elapsed = time.time() - start
-            sleep_time = 1.0 / args.fps - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            if not args.headless:
+                elapsed = time.time() - start
+                sleep_time = 1.0 / args.fps - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
             success_flags = info.get("success", [[False]])
             if any(s for s in success_flags[0]):
