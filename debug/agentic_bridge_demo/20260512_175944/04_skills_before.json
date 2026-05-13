@@ -1,9 +1,0 @@
-{
-  "skills": [
-    "move_forward",
-    "move_backward",
-    "turn_left",
-    "turn_right",
-    "policy_step"
-  ]
-}

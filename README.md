@@ -2,6 +2,8 @@
 
 This is the NVIDIA Isaac GR00T fork repo for running RoboCasa benchmark experiments. This fork is based on the original [GR00T code](https://github.com/NVIDIA/Isaac-GR00T) from NVIDIA. Our fork supports training for **GR00T N1.5**.
 
+![RoboCasa bridge teaser](media/robocasa_webPage.png)
+
 ## Recommended system specs
 
 For inference we recommend a GPU with at least 8 Gb of memory. (5090 Recommended)
